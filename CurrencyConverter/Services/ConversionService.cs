@@ -1,21 +1,28 @@
 ﻿using CurrencyConverter.Providers;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace CurrencyConverter.Services
 {
     public class ConversionService
     {
         private readonly ILogger<ConversionService> _logger;
-        private readonly IFiatProvider _nbu;
-        private readonly ICryptoProvider _crypto;
+        private readonly IFiatProvider _fiatProvider;
+        private readonly ICryptoProvider _cryptProvider;
+        private readonly IMemoryCache _cache;
+        private readonly IConfiguration _config;
 
         public ConversionService(
             ILogger<ConversionService> logger,
-            IFiatProvider nbu,
-            ICryptoProvider crypto)
+            IConfiguration configuration,
+            IFiatProvider fiatProvider,
+            ICryptoProvider cryptoProvider,
+            IMemoryCache cache)
         {
             _logger = logger;
-            _nbu = nbu;
-            _crypto = crypto;
+            _fiatProvider = fiatProvider;
+            _cryptProvider = cryptoProvider;
+            _cache = cache;
+            _config = configuration;
         }
 
         public async Task<CurrencyConversionResponse> ConvertAsync(CurrencyConversionRequest request)
@@ -24,29 +31,32 @@ namespace CurrencyConverter.Services
             var to = request.DestinationCurrency.ToUpperInvariant();
             var amount = request.SourceAmount;
 
-            _logger.LogInformation("Converting {Amount} {From} → {To}", amount, from, to);
+            _logger.LogInformation($"Converting {amount} {from} → {to}");
 
-            var rate = await ResolveRateAsync(from, to);
+            var pairKey = $"{from}_{to}";
 
-            if (rate == null)
+            if (!_cache.TryGetValue(pairKey, out decimal rate))
             {
-                _logger.LogWarning("No exchange rate found for {From}->{To}", from, to);
-                throw new InvalidOperationException($"Rate not available for {from}->{to}");
+                var resolved = await ResolveRateAsync(from, to);
+                if (resolved == null)
+                {
+                    throw new Exception($"Rate not available for {from}->{to}");
+                }
+
+                rate = resolved.Value;
+
+                // Cache for x minutes
+                _cache.Set(pairKey, rate, TimeSpan.FromMinutes(_config.GetValue<int>("CacheMinutes")));
             }
 
-            var result = new CurrencyConversionResponse
+            return new CurrencyConversionResponse
             {
                 SourceCurrency = from,
                 DestinationCurrency = to,
                 SourceAmount = amount,
-                Rate = rate.Value,
-                DestinationAmount = amount * rate.Value
+                Rate = rate,
+                DestinationAmount = amount * rate
             };
-
-            _logger.LogInformation("{From}->{To} rate {Rate} result {Dest}",
-                from, to, result.Rate, result.DestinationAmount);
-
-            return result;
         }
 
         private async Task<decimal?> ResolveRateAsync(string from, string to)
@@ -54,34 +64,34 @@ namespace CurrencyConverter.Services
             if (from == to)
                 return 1m;
 
-            // 1. Try NBU cross (UAH base)
-            var nbuFrom = await _nbu.GetRateAsync(from);
-            var nbuTo = await _nbu.GetRateAsync(to);
-            if (nbuFrom != null && nbuTo != null)
-                return nbuFrom / nbuTo;
+            // 1. Try Fiat 
+            var fiatFrom = await _fiatProvider.GetRateAsync(from);
+            var fiatTo = await _fiatProvider.GetRateAsync(to);
+            if (fiatFrom != null && fiatTo != null)
+                return fiatFrom / fiatTo;
 
-            // 2. Try direct Kraken
-            var direct = await _crypto.GetRateAsync(from, to);
+            // 2. Try direct Crypto
+            var direct = await _cryptProvider.GetRateAsync(from, to);
             if (direct != null)
                 return direct;
 
-            // 3. Try Kraken with USD base
-            var fromUsd = await _crypto.GetRateAsync(from, "USD");
-            var toUsd = await _crypto.GetRateAsync(to, "USD");
-            if (fromUsd != null && toUsd != null)
-                return fromUsd / toUsd;
+            // 3. Try Crpyo with USD
+            var cryptoFrom = await _cryptProvider.GetRateAsync(from, "USD");
+            var cryptoTo = await _cryptProvider.GetRateAsync(to, "USD");
+            if (cryptoFrom != null && cryptoTo != null)
+                return cryptoFrom / cryptoTo;
 
-            // 4. Mix Kraken and NBU
-            if (fromUsd != null && nbuTo != null)
+            // 4. Mix Fiat and Crypto
+            if (cryptoFrom != null && fiatTo != null)
             {
-                var usdToUah = await _nbu.GetRateAsync("USD");
-                return (fromUsd * usdToUah) / nbuTo;
+                var usdToUah = await _fiatProvider.GetRateAsync("USD");
+                return (cryptoFrom * usdToUah) / fiatTo;
             }
 
-            if (toUsd != null && nbuFrom != null)
+            if (cryptoTo != null && fiatFrom != null)
             {
-                var usdToUah = await _nbu.GetRateAsync("USD");
-                return nbuFrom / (toUsd * usdToUah);
+                var usdToUah = await _fiatProvider.GetRateAsync("USD");
+                return fiatFrom / (cryptoTo * usdToUah);
             }
 
             return null;
